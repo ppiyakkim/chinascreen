@@ -26,6 +26,64 @@ DB_PATH = Path("data/cache.db")
 CACHE_TTL_HOURS = 24  # refresh after this many hours
 
 
+def _patch_akshare_tls_fingerprint() -> None:
+    """
+    eastmoney (and other akshare sources) fingerprint the TLS/HTTP client,
+    not just the IP: plain `requests`/urllib3 has a distinct JA3 fingerprint
+    that gets selectively dropped ("RemoteDisconnected"), while curl and real
+    browsers pass through. curl_cffi can impersonate a real Chrome TLS
+    fingerprint, so we route all of akshare's HTTP calls through it.
+
+    Two call patterns exist in akshare: most scrapers call `requests.get`
+    directly, while a few (incl. the universe + industry-board endpoints)
+    go through the centralized `fetch_paginated_data` -> `request_with_retry`
+    helper. Both are patched so every akshare call benefits.
+    """
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        logger.warning("curl_cffi not installed; akshare calls may be blocked by eastmoney.")
+        return
+
+    import requests as _requests
+
+    def _impersonated_get(url, params=None, timeout=15, **kwargs):
+        kwargs.pop("verify", None)
+        return curl_requests.get(
+            url, params=params, timeout=timeout, impersonate="chrome124", **kwargs
+        )
+
+    _requests.get = _impersonated_get
+
+    try:
+        import akshare.utils.func as ak_func_mod
+
+        def _patched_request_with_retry(
+            url, params=None, timeout=15, max_retries=4,
+            base_delay=1.0, random_delay_range=(0.5, 1.5),
+        ):
+            last_exc = None
+            for attempt in range(max_retries):
+                try:
+                    resp = curl_requests.get(
+                        url, params=params, timeout=timeout, impersonate="chrome124"
+                    )
+                    resp.raise_for_status()
+                    return resp
+                except Exception as e:
+                    last_exc = e
+                    if attempt < max_retries - 1:
+                        time.sleep(base_delay * (attempt + 1))
+            raise last_exc
+
+        ak_func_mod.request_with_retry = _patched_request_with_retry
+    except Exception as e:
+        logger.warning(f"Could not patch akshare.utils.func.request_with_retry: {e}")
+
+
+_patch_akshare_tls_fingerprint()
+
+
 def _with_retry(fn, *args, retries: int = 4, base_delay: float = 2.0, **kwargs):
     """
     Retry an akshare call with exponential backoff.
@@ -409,22 +467,27 @@ def fetch_valuation_percentile(tickers: list[str], force: bool = False) -> pd.Da
     for i, ticker in enumerate(tickers):
         rec = {"ticker": ticker}
         try:
-            val = _with_retry(ak.stock_a_indicator_lg, retries=2, base_delay=1.5, symbol=ticker)
-            if val is not None and not val.empty:
-                pe_col = [c for c in val.columns if "pe" in c.lower() or "市盈" in c]
-                pb_col = [c for c in val.columns if "pb" in c.lower() or "市净" in c]
-                if pe_col:
-                    pe_series = pd.to_numeric(val[pe_col[0]], errors="coerce").dropna()
-                    if len(pe_series) > 10:
-                        rec["pe_current"] = pe_series.iloc[-1]
-                        rec["pe_pct"] = (pe_series <= pe_series.iloc[-1]).mean() * 100
-                        rec["pe_5y_low"] = pe_series.quantile(0.05)
-                        rec["pe_5y_high"] = pe_series.quantile(0.95)
-                if pb_col:
-                    pb_series = pd.to_numeric(val[pb_col[0]], errors="coerce").dropna()
-                    if len(pb_series) > 10:
-                        rec["pb_current"] = pb_series.iloc[-1]
-                        rec["pb_pct"] = (pb_series <= pb_series.iloc[-1]).mean() * 100
+            pe_df = _with_retry(
+                ak.stock_zh_valuation_baidu, retries=2, base_delay=1.5,
+                symbol=ticker, indicator="市盈率(TTM)", period="近五年",
+            )
+            if pe_df is not None and not pe_df.empty:
+                pe_series = pd.to_numeric(pe_df["value"], errors="coerce").dropna()
+                if len(pe_series) > 10:
+                    rec["pe_current"] = pe_series.iloc[-1]
+                    rec["pe_pct"] = (pe_series <= pe_series.iloc[-1]).mean() * 100
+                    rec["pe_5y_low"] = pe_series.quantile(0.05)
+                    rec["pe_5y_high"] = pe_series.quantile(0.95)
+
+            pb_df = _with_retry(
+                ak.stock_zh_valuation_baidu, retries=2, base_delay=1.5,
+                symbol=ticker, indicator="市净率", period="近五年",
+            )
+            if pb_df is not None and not pb_df.empty:
+                pb_series = pd.to_numeric(pb_df["value"], errors="coerce").dropna()
+                if len(pb_series) > 10:
+                    rec["pb_current"] = pb_series.iloc[-1]
+                    rec["pb_pct"] = (pb_series <= pb_series.iloc[-1]).mean() * 100
         except Exception:
             pass
 
