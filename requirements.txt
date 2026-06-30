@@ -1,0 +1,15 @@
+akshare>=1.18
+streamlit>=1.35
+pandas>=2.0
+numpy>=1.26
+plotly>=5.20
+tqdm>=4.66
+beautifulsoup4>=4.12
+lxml>=5.0
+openpyxl>=3.1
+xlrd>=2.0
+html5lib>=1.1
+tabulate>=0.9
+curl-cffi>=0.6
+jsonpath-ng>=1.6
+py-mini-racer>=0.6
