@@ -346,8 +346,8 @@ held_col  = ["Held (excl.)"] if "Held (excl.)" in table_df.columns else []
 
 styled = (
     table_df.style
-    .applymap(flag_color, subset=flag_cols)
-    .applymap(excluded_style, subset=held_col)
+    .map(flag_color, subset=flag_cols)
+    .map(excluded_style, subset=held_col)
     .format(na_rep="—")
 )
 
@@ -484,7 +484,7 @@ if selected_ticker:
 
             f_df = pd.DataFrame(forensic_rows)
             st.dataframe(
-                f_df.style.applymap(flag_cell, subset=["Flag"]),
+                f_df.style.map(flag_cell, subset=["Flag"]),
                 use_container_width=True,
                 hide_index=True,
             )
