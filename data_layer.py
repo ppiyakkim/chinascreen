@@ -26,6 +26,29 @@ DB_PATH = Path("data/cache.db")
 CACHE_TTL_HOURS = 24  # refresh after this many hours
 
 
+def _with_retry(fn, *args, retries: int = 4, base_delay: float = 2.0, **kwargs):
+    """
+    Retry an akshare call with exponential backoff.
+    eastmoney's anti-bot layer intermittently drops connections
+    (RemoteDisconnected) for automated clients — retrying almost
+    always succeeds within a couple of attempts.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    f"{fn.__name__} failed (attempt {attempt+1}/{retries}): {e}. "
+                    f"Retrying in {delay:.0f}s …"
+                )
+                time.sleep(delay)
+    raise last_exc
+
+
 # ---------------------------------------------------------------------------
 # Low-level cache helpers
 # ---------------------------------------------------------------------------
@@ -91,7 +114,7 @@ def fetch_universe(force: bool = False) -> pd.DataFrame:
             return df
 
     logger.info("Fetching A-share universe from akshare …")
-    raw = ak.stock_zh_a_spot_em()
+    raw = _with_retry(ak.stock_zh_a_spot_em)
 
     # Column map (akshare returns Chinese headers)
     col_map = {
@@ -156,12 +179,10 @@ def fetch_adtv(tickers: list[str], force: bool = False) -> pd.DataFrame:
 
     for i, ticker in enumerate(tickers):
         try:
-            hist = ak.stock_zh_a_hist(
-                symbol=ticker,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq",
+            hist = _with_retry(
+                ak.stock_zh_a_hist, retries=2, base_delay=1.5,
+                symbol=ticker, period="daily",
+                start_date=start_date, end_date=end_date, adjust="qfq",
             )
             if hist is not None and not hist.empty:
                 # column: '成交额' = turnover in CNY
@@ -210,7 +231,10 @@ def fetch_financials_batch(tickers: list[str], force: bool = False) -> pd.DataFr
     for i, ticker in enumerate(tickers):
         rec = {"ticker": ticker}
         try:
-            ind = ak.stock_financial_analysis_indicator(symbol=ticker, start_year="2020")
+            ind = _with_retry(
+                ak.stock_financial_analysis_indicator, retries=2, base_delay=1.5,
+                symbol=ticker, start_year="2020",
+            )
             if ind is not None and not ind.empty:
                 # grab most-recent row
                 row = ind.iloc[0]
@@ -235,7 +259,10 @@ def fetch_financials_batch(tickers: list[str], force: bool = False) -> pd.DataFr
 
             # grab 8 quarters of gross margin for stability calc
             try:
-                ind_all = ak.stock_financial_analysis_indicator(symbol=ticker, start_year="2022")
+                ind_all = _with_retry(
+                    ak.stock_financial_analysis_indicator, retries=2, base_delay=1.5,
+                    symbol=ticker, start_year="2022",
+                )
                 if ind_all is not None and len(ind_all) >= 4:
                     gm_vals = []
                     for c in ind_all.columns:
@@ -288,7 +315,7 @@ def fetch_cashflow_batch(tickers: list[str], force: bool = False) -> pd.DataFram
     for i, ticker in enumerate(tickers):
         rec = {"ticker": ticker}
         try:
-            ab = ak.stock_financial_abstract(symbol=ticker)
+            ab = _with_retry(ak.stock_financial_abstract, retries=2, base_delay=1.5, symbol=ticker)
             if ab is not None and not ab.empty:
                 def get_item(df, *keys):
                     for key in keys:
@@ -382,7 +409,7 @@ def fetch_valuation_percentile(tickers: list[str], force: bool = False) -> pd.Da
     for i, ticker in enumerate(tickers):
         rec = {"ticker": ticker}
         try:
-            val = ak.stock_a_indicator_lg(symbol=ticker)
+            val = _with_retry(ak.stock_a_indicator_lg, retries=2, base_delay=1.5, symbol=ticker)
             if val is not None and not val.empty:
                 pe_col = [c for c in val.columns if "pe" in c.lower() or "市盈" in c]
                 pb_col = [c for c in val.columns if "pb" in c.lower() or "市净" in c]
@@ -440,7 +467,7 @@ def fetch_industry_tags(tickers: list[str], force: bool = False) -> pd.DataFrame
     records = []
 
     try:
-        boards = ak.stock_board_industry_name_em()
+        boards = _with_retry(ak.stock_board_industry_name_em, retries=3, base_delay=2.0)
         board_names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
     except Exception:
         board_names = []
@@ -452,7 +479,9 @@ def fetch_industry_tags(tickers: list[str], force: bool = False) -> pd.DataFrame
 
     for board in localization_boards_found[:30]:  # cap to avoid excess calls
         try:
-            members = ak.stock_board_industry_cons_em(symbol=board)
+            members = _with_retry(
+                ak.stock_board_industry_cons_em, retries=2, base_delay=1.5, symbol=board
+            )
             if members is not None and not members.empty:
                 code_col = [c for c in members.columns if "代码" in c]
                 if code_col:
